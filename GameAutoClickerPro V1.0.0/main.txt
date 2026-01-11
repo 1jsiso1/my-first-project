@@ -1,0 +1,777 @@
+# main.py
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import pyautogui
+import json
+import threading
+import time
+import math
+import os
+from datetime import datetime
+from pynput import mouse, keyboard
+
+# 全局变量
+running = False
+recording = False
+click_thread = None
+record_thread = None
+MOVE_FOLDER = "moves"
+pressed_keys = set()
+last_move_time = 0
+last_pos = (0, 0)
+SAMPLE_INTERVAL = 0.005  # 5ms采样间隔
+
+# 创建moves目录
+os.makedirs(MOVE_FOLDER, exist_ok=True)
+
+# 线程锁确保状态一致性
+running_lock = threading.Lock()
+recording_lock = threading.Lock()
+
+class Clicker:
+    def __init__(self, events, app):
+        self.events = events
+        self.start_time = None
+        self.app = app  # 引用应用实例用于更新状态
+
+    def start(self):
+        global running
+        with running_lock:
+            running = True
+            
+        pyautogui.FAILSAFE = False
+        self.start_time = time.perf_counter()
+        event_index = 0
+        
+        while self.is_running() and event_index < len(self.events):
+            event = self.events[event_index]
+            target_time = self.start_time + event['timestamp']
+            
+            # 高精度等待
+            sleep_time = target_time - time.perf_counter()
+            if sleep_time > 0:
+                time.sleep(min(sleep_time, 0.1))  # 避免长时间空循环
+            
+            # 检查是否应该停止
+            if not self.is_running():
+                break
+            
+            # 更新状态显示
+            if hasattr(self.app, 'status_var'):
+                self.app.status_var.set(f"回放中: {os.path.basename(self.app.current_filename)} 按Ctrl+E停止")
+            
+            # 根据事件类型执行对应操作
+            if event['type'] == 'click':
+                pyautogui.click(event['x'], event['y'])
+            elif event['type'] == 'right_click':
+                pyautogui.rightClick(event['x'], event['y'])
+            elif event['type'] == 'long':
+                self._hold_mouse(event['x'], event['y'], event['duration'])
+            elif event['type'] == 'slide':
+                self._slide_mouse(event['path'])
+            
+            event_index += 1
+        
+        with running_lock:
+            running = False
+            if hasattr(self.app, 'status_var'):
+                self.app.status_var.set("已停止")
+
+    def is_running(self):
+        """检查是否仍在运行状态"""
+        with running_lock:
+            return running
+
+    def _hold_mouse(self, x, y, duration):
+        """精确长按实现"""
+        pyautogui.mouseDown(x, y)  # 按下鼠标
+        start = time.perf_counter()
+        while (time.perf_counter() - start) < duration and self.is_running():
+            time.sleep(0.01)
+        pyautogui.mouseUp()  # 释放鼠标
+
+    def _slide_mouse(self, path):
+        """修复后的完整拖拽实现"""
+        if not path or len(path) < 2:
+            return
+        
+        # 获取完整路径点
+        points = [(p['x'], p['y']) for p in path]
+        
+        try:
+            # 模拟按下-拖动-释放完整流程
+            pyautogui.mouseDown(*points[0])  # 按下起始点
+            time.sleep(0.05)  # 模拟按下延迟
+            
+            # 遍历所有路径点
+            for x, y in points[1:]:
+                # 实时更新位置
+                pyautogui.moveTo(x, y)
+                # 根据实际时间戳同步
+                current_time = time.perf_counter()
+                target_time = self.start_time + path[len(points)-1]['timestamp']
+                if current_time < target_time:
+                    time.sleep(target_time - current_time)
+            
+            # 确保最终位置准确
+            pyautogui.moveTo(*points[-1])
+            time.sleep(0.05)  # 模拟释放前停顿
+            
+        finally:
+            # 确保最终释放鼠标
+            pyautogui.mouseUp(*points[-1])
+
+class Recorder:
+    def __init__(self):
+        self.events = []
+        self.start_time = None
+        self.press_start = None
+        self.is_pressing = False
+        self.path_points = []
+        self.last_sample = 0
+        self.last_release_time = 0  # 记录上一次释放的时间
+        self.current_button = mouse.Button.left  # 默认左键
+
+    def start_recording(self):
+        global recording, last_move_time, last_pos
+        # 标记为录制状态
+        with recording_lock:
+            recording = True
+            
+        self.events = []
+        self.start_time = time.perf_counter()
+        self.press_start = None
+        self.is_pressing = False
+        self.path_points = []
+        self.last_sample = self.start_time
+        self.last_release_time = 0  # 初始化上一次释放时间为0
+        last_move_time = self.start_time
+        last_pos = pyautogui.position()
+        
+        def on_click(x, y, button, pressed):
+            """鼠标点击事件处理"""
+            if not self.is_recording():
+                return
+            
+            current_time = time.perf_counter()
+            elapsed = current_time - self.start_time
+            
+            # 处理按下事件
+            if pressed:
+                # 记录按下事件
+                self.press_start = current_time
+                self.is_pressing = True
+                self.path_points = [{
+                    'x': x,
+                    'y': y,
+                    'timestamp': elapsed
+                }]
+                # 记录当前点击的按钮
+                self.current_button = button
+                
+            # 处理释放事件
+            elif not pressed and self.is_pressing:
+                # 记录释放事件
+                duration = current_time - self.press_start
+                
+                # 计算与上一次操作的间隔
+                operation_interval = elapsed - self.last_release_time
+                self.last_release_time = elapsed
+                
+                # 判断操作类型
+                if self._is_slide(self.path_points):
+                    # 滑动操作
+                    event_type = 'slide'
+                elif duration > 0.3:  # 长按阈值 (300ms)
+                    # 长按操作
+                    event_type = 'long'
+                else:
+                    # 普通点击 - 根据实际按下的按钮确定类型
+                    if button == mouse.Button.left:
+                        event_type = 'click'
+                    elif button == mouse.Button.right:
+                        event_type = 'right_click'
+                    else:
+                        event_type = 'click'  # 默认左键
+                
+                # 添加事件
+                self.add_event(event_type, x, y, elapsed, operation_interval)
+                
+                # 如果是滑动，添加路径数据
+                if event_type == 'slide':
+                    self.events[-1]['path'] = self.path_points
+                elif event_type == 'long':
+                    self.events[-1]['duration'] = duration
+                
+                self.is_pressing = False
+        
+        def on_move(x, y):
+            """鼠标移动事件处理"""
+            if not self.is_recording() or not self.is_pressing:
+                return
+            
+            current_time = time.perf_counter()
+            elapsed = current_time - self.start_time
+            
+            # 采样间隔控制
+            if current_time - self.last_sample >= SAMPLE_INTERVAL:
+                # 记录轨迹点
+                self.path_points.append({
+                    'x': x,
+                    'y': y,
+                    'timestamp': elapsed
+                })
+                
+                self.last_sample = current_time
+        
+        # 启动鼠标监听
+        self.mouse_listener = mouse.Listener(
+            on_click=on_click,
+            on_move=on_move
+        )
+        self.mouse_listener.start()
+
+    def is_recording(self):
+        """检查是否仍在录制状态"""
+        with recording_lock:
+            return recording
+
+    def stop_recording(self):
+        """停止录制"""
+        with recording_lock:
+            global recording
+            recording = False
+            
+        if self.mouse_listener:
+            self.mouse_listener.stop()
+        return self.events
+
+    def add_event(self, event_type, x, y, timestamp, interval):
+        """添加事件到记录列表"""
+        self.events.append({
+            'timestamp': timestamp,  # 绝对时间戳
+            'type': event_type,
+            'x': x,
+            'y': y,
+            'interval': interval  # 与上一个操作的间隔时间
+        })
+
+    def _is_slide(self, points):
+        """判断是否为滑动操作"""
+        if len(points) < 5:  # 至少5个点
+            return False
+        
+        # 计算总移动距离
+        total_distance = 0
+        for i in range(1, len(points)):
+            dx = points[i]['x'] - points[i-1]['x']
+            dy = points[i]['y'] - points[i-1]['y']
+            total_distance += math.hypot(dx, dy)
+        
+        return total_distance > 30  # 至少移动30像素
+
+
+class AutoClickerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("游戏连招模拟器 Pro v1.0.0")  # 新增版本号
+        self.root.geometry("630x650")  # 初始窗口大小
+        self.root.minsize(100, 100)  # 最小尺寸设为100x100
+        self.root.resizable(True, True)  # 允许调整大小
+        
+        # 设置字体
+        self.font_title = ("微软雅黑", 16, "bold")
+        self.font_section = ("微软雅黑", 12)
+        self.font_normal = ("微软雅黑", 10)
+        
+        self.current_view = "main"
+        self.recorder = None
+        self.move_list = self.load_move_list()
+        self.create_widgets()
+        
+        # 设置关闭窗口事件处理
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+    def create_widgets(self):
+        """创建并布局界面控件"""
+        # 主界面
+        if self.current_view == "main":
+            self.clear_frame()
+            
+            # 使用网格布局管理器
+            self.root.grid_columnconfigure(0, weight=1)
+            self.root.grid_rowconfigure(0, weight=1)
+            
+            # 主框架
+            main_frame = ttk.Frame(self.root, padding=20)
+            main_frame.grid(row=0, column=0, sticky="nsew")
+            main_frame.grid_columnconfigure(0, weight=1)
+            
+            # 标题栏
+            title = ttk.Label(main_frame, text="游戏连招模拟器 Pro", font=self.font_title)
+            title.grid(row=0, column=0, pady=(0, 20), sticky="w")
+            
+            # ==== 单一循环点击 ====
+            section1 = ttk.Label(main_frame, text="==== 单一循环点击 ====", font=self.font_section)
+            section1.grid(row=1, column=0, pady=(0, 10), sticky="w")
+            
+            # 坐标设置框架
+            coord_frame = ttk.LabelFrame(main_frame, text="坐标设置", padding=10)
+            coord_frame.grid(row=2, column=0, sticky="ew", pady=5)
+            coord_frame.grid_columnconfigure(1, weight=1)
+            
+            # X坐标
+            ttk.Label(coord_frame, text="X坐标:", font=self.font_normal).grid(row=0, column=0, padx=5, pady=5, sticky="w")
+            self.x_var = tk.StringVar(value="500")
+            x_entry = ttk.Entry(coord_frame, textvariable=self.x_var, width=15, font=self.font_normal)
+            x_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+            
+            # Y坐标
+            ttk.Label(coord_frame, text="Y坐标:", font=self.font_normal).grid(row=1, column=0, padx=5, pady=5, sticky="w")
+            self.y_var = tk.StringVar(value="500")
+            y_entry = ttk.Entry(coord_frame, textvariable=self.y_var, width=15, font=self.font_normal)
+            y_entry.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+            
+            # 参数设置框架
+            param_frame = ttk.LabelFrame(main_frame, text="点击参数", padding=10)
+            param_frame.grid(row=3, column=0, sticky="ew", pady=5)
+            param_frame.grid_columnconfigure(1, weight=1)
+            
+            # 点击间隔
+            ttk.Label(param_frame, text="点击间隔(ms):", font=self.font_normal).grid(row=0, column=0, padx=5, pady=5, sticky="w")
+            self.interval_var = tk.StringVar(value="100")
+            interval_entry = ttk.Entry(param_frame, textvariable=self.interval_var, width=15, font=self.font_normal)
+            interval_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+            
+            # 持续时间
+            ttk.Label(param_frame, text="持续时间(秒):", font=self.font_normal).grid(row=1, column=0, padx=5, pady=5, sticky="w")
+            self.duration_var = tk.StringVar(value="60")
+            duration_entry = ttk.Entry(param_frame, textvariable=self.duration_var, width=15, font=self.font_normal)
+            duration_entry.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+            
+            # 单一循环按钮组
+            btn_frame1 = ttk.Frame(main_frame)
+            btn_frame1.grid(row=4, column=0, pady=15, sticky="ew")
+            btn_frame1.grid_columnconfigure(0, weight=1)
+            btn_frame1.grid_columnconfigure(1, weight=1)
+            btn_frame1.grid_columnconfigure(2, weight=1)
+            
+            ttk.Button(btn_frame1, text="获取当前位置", command=self.get_position, width=15).grid(row=0, column=0, padx=5)
+            self.start_click_btn = ttk.Button(btn_frame1, text="启动连点", command=self.start_click, width=15)
+            self.start_click_btn.grid(row=0, column=1, padx=5)
+            self.stop_click_btn = ttk.Button(btn_frame1, text="紧急停止", command=self.emergency_stop, width=15, style="Emergency.TButton")
+            self.stop_click_btn.grid(row=0, column=2, padx=5)
+            self.stop_click_btn['state'] = 'disabled'
+            
+            # ==== 复制路径点击 ====
+            section2 = ttk.Label(main_frame, text="==== 复制路径点击 ====", font=self.font_section)
+            section2.grid(row=5, column=0, pady=(20, 10), sticky="w")
+            
+            # 路径记录按钮组
+            btn_frame2 = ttk.Frame(main_frame)
+            btn_frame2.grid(row=6, column=0, pady=10, sticky="ew")
+            btn_frame2.grid_columnconfigure(0, weight=1)
+            btn_frame2.grid_columnconfigure(1, weight=1)
+            btn_frame2.grid_columnconfigure(2, weight=1)
+            
+            self.start_record_btn = ttk.Button(btn_frame2, text="开始记录", command=self.start_recording, width=15)
+            self.start_record_btn.grid(row=0, column=0, padx=5)
+            self.stop_record_btn = ttk.Button(btn_frame2, text="停止记录", command=self.stop_recording_and_save, width=15)
+            self.stop_record_btn.grid(row=0, column=1, padx=5)
+            self.stop_record_btn['state'] = 'disabled'
+            
+            # 动作库按钮
+            archive_btn = ttk.Button(btn_frame2, text="动作库", command=lambda: self.show_view("archive"), width=15)
+            archive_btn.grid(row=0, column=2, padx=5)
+            
+            # 状态栏
+            status_frame = ttk.Frame(main_frame)
+            status_frame.grid(row=7, column=0, pady=(20, 0), sticky="ew")
+            
+            self.status_var = tk.StringVar(value="就绪")
+            status_label = ttk.Label(status_frame, textvariable=self.status_var, font=self.font_normal, foreground="green")
+            status_label.pack(side=tk.LEFT, anchor="w")
+            
+            # 创建自定义样式
+            style = ttk.Style()
+            style.configure("Emergency.TButton", foreground="white", background="#ff4444", font=self.font_normal)
+            style.map("Emergency.TButton", 
+                      background=[('active', '#ff0000'), ('disabled', '#cccccc')],
+                      foreground=[('active', 'white'), ('disabled', '#888888')])
+
+        # 动作库界面
+        elif self.current_view == "archive":
+            self.clear_frame()
+            
+            # 使用网格布局管理器
+            self.root.grid_columnconfigure(0, weight=1)
+            self.root.grid_rowconfigure(0, weight=1)
+            
+            # 主框架
+            main_frame = ttk.Frame(self.root, padding=20)
+            main_frame.grid(row=0, column=0, sticky="nsew")
+            main_frame.grid_columnconfigure(0, weight=1)
+            main_frame.grid_rowconfigure(1, weight=1)
+            
+            # 标题栏
+            title_frame = ttk.Frame(main_frame)
+            title_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+            
+            title = ttk.Label(title_frame, text="动作库管理", font=self.font_title)
+            title.pack(side=tk.LEFT)
+            
+            # 动作列表
+            list_frame = ttk.LabelFrame(main_frame, text="动作列表", padding=10)
+            list_frame.grid(row=1, column=0, sticky="nsew", pady=5)
+            list_frame.grid_columnconfigure(0, weight=1)
+            list_frame.grid_rowconfigure(0, weight=1)
+            
+            # 添加滚动条
+            scrollbar = ttk.Scrollbar(list_frame)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            
+            self.archive_listbox = tk.Listbox(
+                list_frame, 
+                yscrollcommand=scrollbar.set,
+                font=self.font_normal,
+                selectbackground="#a6a6a6"
+            )
+            self.archive_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scrollbar.config(command=self.archive_listbox.yview)
+            
+            # 加载动作
+            for name in self.move_list:
+                self.archive_listbox.insert(tk.END, name)
+            
+            # 操作按钮
+            btn_frame = ttk.Frame(main_frame)
+            btn_frame.grid(row=2, column=0, sticky="ew", pady=10)
+            btn_frame.grid_columnconfigure(0, weight=1)
+            btn_frame.grid_columnconfigure(1, weight=1)
+            btn_frame.grid_columnconfigure(2, weight=1)
+            
+            ttk.Button(btn_frame, text="播放选中动作", command=self.play_archive).grid(row=0, column=0, padx=5)
+            ttk.Button(btn_frame, text="删除选中动作", command=self.delete_archive).grid(row=0, column=1, padx=5)
+            
+            # 返回主界面按钮放在删除按钮右边
+            back_btn = ttk.Button(btn_frame, text="返回主界面", command=lambda: self.show_view("main"))
+            back_btn.grid(row=0, column=2, padx=5)
+            
+            # 状态栏
+            status_frame = ttk.Frame(main_frame)
+            status_frame.grid(row=3, column=0, pady=(10, 0), sticky="ew")
+            
+            self.status_var = tk.StringVar(value="就绪")
+            status_label = ttk.Label(status_frame, textvariable=self.status_var, font=self.font_normal, foreground="green")
+            status_label.pack(side=tk.LEFT, anchor="w")
+
+    def clear_frame(self):
+        """清除当前界面所有控件"""
+        for widget in self.root.winfo_children():
+            widget.destroy()
+
+    def show_view(self, view_name):
+        """切换界面视图"""
+        self.current_view = view_name
+        self.create_widgets()
+
+    def get_position(self):
+        """获取当前鼠标位置并更新输入框"""
+        x, y = pyautogui.position()
+        self.x_var.set(str(x))
+        self.y_var.set(str(y))
+        self.status_var.set(f"当前位置: X={x}, Y={y}")
+
+    def start_click(self):
+        """启动连点功能"""
+        # 检查是否已在运行
+        with running_lock:
+            if running:
+                return
+        
+        try:
+            # 参数转换
+            x = int(self.x_var.get())
+            y = int(self.y_var.get())
+            interval = float(self.interval_var.get()) / 1000
+            duration = float(self.duration_var.get())
+            total_clicks = int(duration / interval)
+            
+            # 创建点击事件列表
+            events = [{
+                'type': 'click', 
+                'x': x, 
+                'y': y,
+                'timestamp': i * interval
+            } for i in range(total_clicks)]
+            
+            # 启动线程
+            global click_thread
+            click_thread = threading.Thread(
+                target=lambda: Clicker(events, self).start(),
+                daemon=True
+            )
+            click_thread.start()
+            self.status_var.set("运行中... 按Ctrl+E停止")
+            
+            # 更新按钮状态
+            self.start_click_btn['state'] = 'disabled'
+            self.stop_click_btn['state'] = 'normal'
+        except Exception as e:
+            self.status_var.set(f"错误: {str(e)}")
+
+    def emergency_stop(self):
+        """增强的紧急停止处理"""
+        global running, recording
+        
+        # 停止所有操作
+        with running_lock:
+            running = False
+            
+        with recording_lock:
+            if recording:
+                recording = False
+                if self.recorder and self.recorder.mouse_listener:
+                    self.recorder.mouse_listener.stop()
+        
+        # 强制重置UI状态
+        self.start_click_btn['state'] = 'normal'
+        self.stop_click_btn['state'] = 'disabled'
+        self.start_record_btn['state'] = 'normal'
+        self.stop_record_btn['state'] = 'disabled'
+        self.status_var.set("已紧急停止")
+
+    def start_recording(self):
+        """开始录制鼠标操作"""
+        # 检查是否已在录制
+        with recording_lock:
+            if recording:
+                return
+        
+        try:
+            self.recorder = Recorder()
+            # 启动录制线程
+            global record_thread
+            record_thread = threading.Thread(
+                target=self.recorder.start_recording,
+                daemon=True
+            )
+            record_thread.start()
+            self.status_var.set("正在记录... 按Ctrl+F停止并保存")
+            
+            # 更新按钮状态
+            self.start_record_btn['state'] = 'disabled'
+            self.stop_record_btn['state'] = 'normal'
+        except Exception as e:
+            self.status_var.set(f"记录错误: {str(e)}")
+
+    def stop_recording_and_save(self):
+        """停止录制并保存动作"""
+        # 检查是否在录制状态
+        with recording_lock:
+            if not recording:
+                return
+        
+        # 停止录制并获取事件
+        events = self.recorder.stop_recording()
+        
+        # 保存动作
+        if events:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            default_filename = f"动作_{timestamp}.json"
+            
+            filename = filedialog.asksaveasfilename(
+                initialdir=MOVE_FOLDER,
+                initialfile=default_filename,
+                defaultextension=".json",
+                filetypes=[("JSON文件", "*.json")],
+                title="保存动作记录"
+            )
+            
+            if filename:
+                try:
+                    # 记录当前文件名用于状态显示
+                    self.current_filename = os.path.basename(filename)
+                    
+                    with open(filename, 'w') as f:
+                        json.dump(events, f, indent=2)
+                    # 切换到档案管理界面
+                    self.show_view("archive")
+                    # 重新加载列表
+                    self.move_list = self.load_move_list()
+                    self.update_archive_list()
+                    self.status_var.set(f"已保存: {os.path.basename(filename)}")
+                except Exception as e:
+                    self.status_var.set(f"保存失败: {str(e)}")
+            else:
+                self.status_var.set("已取消保存")
+        else:
+            self.status_var.set("录制为空或已取消")
+        
+        # 更新按钮状态
+        self.start_record_btn['state'] = 'normal'
+        self.stop_record_btn['state'] = 'disabled"
+
+    def load_move_list(self):
+        """加载moves目录中的所有JSON文件"""
+        return [f for f in os.listdir(MOVE_FOLDER) if f.endswith('.json')]
+
+    def update_archive_list(self):
+        """更新动作列表显示"""
+        if hasattr(self, 'archive_listbox') and self.current_view == "archive":
+            self.archive_listbox.delete(0, tk.END)
+            for name in self.move_list:
+                self.archive_listbox.insert(tk.END, name)
+
+    def delete_archive(self):
+        """删除选中的动作（带确认提示）"""
+        if not hasattr(self, 'archive_listbox'):
+            return
+            
+        selection = self.archive_listbox.curselection()
+        if not selection: 
+            self.status_var.set("请选择一个动作")
+            return
+        
+        # 保存删除前的文件名
+        deleted_name = self.move_list[selection[0]]
+        
+        # 新增确认对话框
+        confirm = messagebox.askyesno(
+            "确认删除", 
+            "是否要删除选中的动作？\n\n文件: " + deleted_name
+        )
+        if not confirm:
+            return  # 用户取消删除
+        
+        try:
+            filename = os.path.join(MOVE_FOLDER, deleted_name)
+            os.remove(filename)
+            self.move_list = self.load_move_list()
+            self.update_archive_list()
+            self.status_var.set(f"已删除: {deleted_name}")
+        except Exception as e:
+            self.status_var.set(f"删除失败: {str(e)}")
+
+    def play_archive(self):
+        """播放选中的动作"""
+        if not hasattr(self, 'archive_listbox'):
+            return
+            
+        # 检查是否已在运行
+        with running_lock:
+            if running:
+                return
+        
+        # 获取选中的动作
+        selection = self.archive_listbox.curselection()
+        if not selection: 
+            self.status_var.set("请选择一个动作")
+            return
+        
+        try:
+            filename = os.path.join(MOVE_FOLDER, self.move_list[selection[0]])
+            self.current_filename = self.move_list[selection[0]]  # 记录当前文件名
+            
+            with open(filename, 'r') as f:
+                events = json.load(f)
+            
+            # 启动回放线程
+            global click_thread
+            click_thread = threading.Thread(
+                target=lambda: Clicker(events, self).start(),
+                daemon=True
+            )
+            click_thread.start()
+            self.status_var.set(f"回放中: {self.move_list[selection[0]]} 按Ctrl+E停止")
+        except Exception as e:
+            self.status_var.set(f"回放错误: {str(e)}")
+
+    def on_close(self):
+        """窗口关闭事件处理"""
+        # 停止所有操作
+        with running_lock:
+            global running
+            running = False
+            
+        with recording_lock:
+            global recording
+            recording = false
+        
+        # 关闭应用程序
+        self.root.destroy()
+
+
+# 全局快捷键处理函数
+def on_press(key):
+    """处理按键按下事件"""
+    try:
+        # 添加按键到集合
+        pressed_keys.add(key)
+        
+        # 检查Ctrl键是否按下
+        ctrl_pressed = any(k in (keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r) 
+                        for k in pressed_keys)
+        
+        # 检查E键是否按下
+        e_pressed = any(
+            isinstance(k, keyboard.KeyCode) and 
+            hasattr(k, 'char') and
+            k.char and
+            k.char.lower() == 'e'
+            for k in pressed_keys
+        )
+        
+        # 检查F键是否按下
+        f_pressed = any(
+            isinstance(k, keyboard.KeyCode) and
+            hasattr(k, 'char') and
+            k.char and
+            k.char.lower() == 'f'
+            for k in pressed_keys  # 修正为 pressed_keys
+        )
+        
+        # 组合键检测
+        if ctrl_pressed and e_pressed:
+            # 停止连点
+            if hasattr(app, 'root'):
+                app.root.after(0, app.emergency_stop)
+            
+        elif ctrl_pressed and f_pressed:
+            # 停止录制并保存
+            if hasattr(app, 'root'):
+                app.root.after(0, app.stop_recording_and_save)
+            
+    except AttributeError:
+        # 忽略特殊按键导致的错误
+        pass
+
+def on_release(key):
+    """处理按键释放事件"""
+    try:
+        # 释放Ctrl键时清空集合
+        if key in (keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
+            pressed_keys.clear()
+        # 移除释放的按键
+        elif key in pressed_keys:
+            pressed_keys.remove(key)
+    except KeyError:
+        # 忽略不存在的键错误
+        pass
+
+
+# 主程序入口
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = AutoClickerApp(root)
+    
+    # 启动键盘监听
+    keyboard_listener = keyboard.Listener(
+        on_press=on_press,
+        on_release=on_release
+    )
+    keyboard_listener.daemon = true
+    keyboard_listener.start()
+    
+    # 启动主循环
+    root.mainloop()
